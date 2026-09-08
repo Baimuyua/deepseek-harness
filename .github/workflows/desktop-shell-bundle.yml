@@ -78,7 +78,7 @@ jobs:
 
       - name: bundle desktop shell
         working-directory: apps/desktop-shell/src-tauri
-        run: npx -y @tauri-apps/cli@^2 build
+        run: npx -y @tauri-apps/cli@^2 build --verbose
         shell: bash
 
       - name: bundle smoke (macOS only)
