@@ -9,7 +9,7 @@
 //        [--dsh-version 0.1.3-alpha.2] [--node-version v24.11.1]
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 const SRCTAURI = resolve(dirname(fileURLToPath(import.meta.url)), '../src-tauri');
 const RUNTIME_DIR = join(SRCTAURI, 'resources/runtime');
 const PLATFORMS = ['darwin-arm64', 'win-x64', 'linux-x64'];
+// node-pty's prebuilds directory names differ from ours on Windows.
+const PTY_PREBUILD_DIR = { 'darwin-arm64': 'darwin-arm64', 'win-x64': 'win32-x64', 'linux-x64': 'linux-x64' };
 
 function parseArgs(argv) {
   const args = { dshVersion: '0.1.3-alpha.2', nodeVersion: 'v24.11.1' };
@@ -50,8 +52,10 @@ async function download(url, dest) {
 
 // Extract an archive downloaded to `file` into `dir`, stripping the top level.
 function extract(file, dir) {
-  // Windows CI ships bsdtar (tar handles .zip); the node archives are tar.gz.
-  run('tar', ['-xf', file, '-C', dir, '--strip-components=1']);
+  // Windows CI ships bsdtar (tar handles .zip), which parses the colon in
+  // `C:\...` as an rmt host:path; --force-local keeps such paths local.
+  const forceLocal = process.platform === 'win32' ? ['--force-local'] : [];
+  run('tar', [...forceLocal, '-xf', file, '-C', dir, '--strip-components=1']);
 }
 
 async function embedNode(platform, nodeVersion) {
@@ -98,10 +102,57 @@ async function embedDsh(platform, dshVersion) {
   if (!existsSync(bin)) throw new Error(`dsh CLI entry missing after install: ${bin}`);
 }
 
+// Sum the bytes removed by deleting every file matching `predicate` under dir.
+async function stripFiles(dir, predicate) {
+  let removed = 0;
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      removed += await stripFiles(path, predicate);
+    } else if (predicate(entry.name)) {
+      const { size } = await stat(path);
+      removed += size;
+      await rm(path);
+    }
+  }
+  return removed;
+}
+
+// Drop everything the sidecar never loads: Node build headers and its bundled
+// npm/corepack (used only during this script), Node docs, dsh sourcemaps and
+// type declarations, and node-pty prebuilds for other platforms.
+async function pruneRuntime(platform) {
+  const nodeDir = join(RUNTIME_DIR, 'node');
+  for (const rel of [
+    'include', 'share', 'README.md', 'CHANGELOG.md',
+    'lib/node_modules/npm', 'lib/node_modules/corepack',
+    'node_modules/npm', 'node_modules/corepack',
+    'bin/npm', 'bin/npx', 'bin/corepack',
+    'npm', 'npm.cmd', 'npx', 'npx.cmd', 'corepack', 'corepack.cmd',
+  ]) {
+    await rm(join(nodeDir, rel), { recursive: true, force: true });
+  }
+  const dshDir = join(RUNTIME_DIR, 'dsh');
+  const isDeclaration = (name) => /\.d\.(ts|cts|mts)$/.test(name);
+  const maps = await stripFiles(dshDir, (name) => name.endsWith('.map'));
+  const types = await stripFiles(dshDir, isDeclaration);
+  const prebuilds = join(dshDir, 'node_modules/node-pty/prebuilds');
+  if (existsSync(prebuilds)) {
+    for (const entry of await readdir(prebuilds)) {
+      if (entry !== PTY_PREBUILD_DIR[platform]) {
+        await rm(join(prebuilds, entry), { recursive: true, force: true });
+      }
+    }
+  }
+  return { maps, types };
+}
+
 const args = parseArgs(process.argv);
 await mkdir(RUNTIME_DIR, { recursive: true });
 await embedNode(args.platform, args.nodeVersion);
 await embedDsh(args.platform, args.dshVersion);
+const pruned = await pruneRuntime(args.platform);
+console.log(`pruned ${(pruned.maps / 1e6).toFixed(1)}MB sourcemaps, ${(pruned.types / 1e6).toFixed(1)}MB type declarations`);
 const manifest = {
   protocol: 1,
   dshVersion: args.dshVersion,

@@ -59,9 +59,12 @@ jobs:
 
       - name: install linux webkit deps
         if: runner.os == 'Linux'
+        # libfuse2: linuxdeploy (the AppImage tool tauri runs) is itself an
+        # AppImage and needs FUSE, which ubuntu-latest no longer preinstalls.
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64
 
       # The app embeds the published @deepseek-ai/dsh npm tree plus an
       # official Node distribution, so the bundle needs no repo build.
