@@ -9,7 +9,7 @@
 //        [--dsh-version 0.1.3-alpha.2] [--node-version v24.11.1]
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -51,15 +51,25 @@ async function download(url, dest) {
 }
 
 // Extract an archive downloaded to `file` into `dir`, stripping the top level.
-function extract(file, dir) {
-  // Windows CI ships bsdtar (tar handles .zip), which parses the colon in
-  // `C:\...` as an rmt host:path; --force-local keeps such paths local.
-  const forceLocal = process.platform === 'win32' ? ['--force-local'] : [];
-  run('tar', [...forceLocal, '-xf', file, '-C', dir, '--strip-components=1']);
+// The Windows Node dist only ships as .zip and Windows runners resolve GNU
+// tar (no zip support) in bash, so extract through Expand-Archive there.
+async function extract(file, dir, topLevel) {
+  if (process.platform === 'win32') {
+    const stage = `${dir}.stage`;
+    await rm(stage, { recursive: true, force: true });
+    run('powershell', [
+      '-NoProfile', '-Command',
+      `Expand-Archive -LiteralPath '${file}' -DestinationPath '${stage}' -Force`,
+    ]);
+    await cp(join(stage, topLevel), dir, { recursive: true });
+    await rm(stage, { recursive: true, force: true });
+    return;
+  }
+  run('tar', ['-xf', file, '-C', dir, '--strip-components=1']);
 }
 
 async function embedNode(platform, nodeVersion) {
-  const distDir = platform === 'win-x64' ? `node-${nodeVersion}-${platform}` : `node-${nodeVersion}-${platform}`;
+  const distDir = `node-${nodeVersion}-${platform}`;
   const ext = platform === 'win-x64' ? 'zip' : 'tar.gz';
   const url = `https://nodejs.org/dist/${nodeVersion}/${distDir}.${ext}`;
   const work = await mkdtemp(join(tmpdir(), 'dsh-node-'));
@@ -68,7 +78,7 @@ async function embedNode(platform, nodeVersion) {
   const nodeDir = join(RUNTIME_DIR, 'node');
   await rm(nodeDir, { recursive: true, force: true });
   await mkdir(nodeDir, { recursive: true });
-  extract(archive, nodeDir);
+  await extract(archive, nodeDir, distDir);
   const expected = platform === 'win-x64' ? 'node.exe' : 'bin/node';
   await stat(join(nodeDir, expected));
   await rm(work, { recursive: true, force: true });
