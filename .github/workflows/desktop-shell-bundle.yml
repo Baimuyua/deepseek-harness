@@ -1,0 +1,89 @@
+name: Desktop shell bundle
+
+on:
+  push:
+    branches: [desktop-shell]
+    paths:
+      - 'apps/desktop-shell/**'
+      - 'packages/**'
+      - 'apps/cli/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/desktop-shell-bundle.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref to build (branch/tag/sha)
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  bundle:
+    name: desktop shell / ${{ matrix.name }}
+    timeout-minutes: 60
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+            artifacts: apps/desktop-shell/src-tauri/target/release/bundle
+          - os: windows-latest
+            name: windows-x64
+            artifacts: apps/desktop-shell/src-tauri/target/release/bundle
+          - os: ubuntu-latest
+            name: linux-x64
+            artifacts: apps/desktop-shell/src-tauri/target/release/bundle
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: pnpm
+
+      - name: install linux webkit deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - run: pnpm install --frozen-lockfile
+        shell: bash
+
+      # dsh web requires the built frontend dist at startup; the shell spawns
+      # the CLI from source, so the whole repo must be built before bundling.
+      - run: pnpm run build
+        shell: bash
+
+      - name: bundle desktop shell
+        working-directory: apps/desktop-shell/src-tauri
+        run: npx -y @tauri-apps/cli@^2 build
+        shell: bash
+
+      - name: bundle smoke (macOS only)
+        if: runner.os == 'macOS'
+        run: codesign -dvv "apps/desktop-shell/src-tauri/target/release/bundle/macos/DeepSeek Harness.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error

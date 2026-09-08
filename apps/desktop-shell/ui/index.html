@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DeepSeek Harness</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #101418;
+        color: #e8eaed;
+        font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+      }
+      #stage {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+      }
+      #mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 3px solid #2c3440;
+        border-top-color: #4d8cff;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      #status { font-size: 14px; color: #9aa4b2; }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <div id="mark"></div>
+      <div id="status">正在启动 DeepSeek Harness…</div>
+    </div>
+    <script>
+      window.dshSetStatus = function (text) {
+        document.getElementById('status').textContent = text;
+        document.getElementById('mark').style.display =
+          text.indexOf('失败') >= 0 || text.indexOf('failed') >= 0 ? 'none' : '';
+      };
+    </script>
+  </body>
+</html>
