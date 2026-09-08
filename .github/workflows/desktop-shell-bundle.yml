@@ -39,7 +39,10 @@ jobs:
             name: macos-arm64
             runtime-platform: darwin-arm64
             artifacts: apps/desktop-shell/src-tauri/target/release/bundle
-          - os: windows-latest
+          # fs-ext compiles from source via node-gyp on install; windows-latest
+          # ships VS 18, which node-gyp cannot drive, so pin windows-2022
+          # (VS 2022) for the C++ toolchain.
+          - os: windows-2022
             name: windows-x64
             runtime-platform: win-x64
             artifacts: apps/desktop-shell/src-tauri/target/release/bundle
