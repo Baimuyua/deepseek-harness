@@ -154,6 +154,18 @@ async function pruneRuntime(platform) {
       }
     }
   }
+  if (platform === 'linux-x64') {
+    // linuxdeploy scans every ELF under resources/: the musl koffi variant
+    // (bundled inside the same npm package) has no libc.musl on a glibc
+    // runner and fails the AppImage build, and fs-ext's intermediate .o
+    // files only trip patchelf. Both are dead weight at runtime.
+    for (const rel of [
+      'node_modules/@koromix/koffi-linux-x64/musl_x64',
+      'node_modules/fs-ext/build/Release/obj.target',
+    ]) {
+      await rm(join(dshDir, rel), { recursive: true, force: true });
+    }
+  }
   return { maps, types };
 }
 
