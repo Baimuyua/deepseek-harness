@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   PRIMARY_NODE_VERSION: '24'
@@ -87,3 +87,31 @@ jobs:
           name: dsh-desktop-${{ matrix.name }}
           path: ${{ matrix.artifacts }}
           if-no-files-found: error
+
+  release:
+    name: publish desktop-latest release
+    needs: bundle
+    if: success() && github.ref == 'refs/heads/desktop-shell'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dsh-desktop-*
+          path: dist
+          merge-multiple: true
+
+      - name: publish rolling prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-latest
+          name: dsh desktop (rolling)
+          prerelease: true
+          files: |
+            dist/dmg/*.dmg
+            dist/msi/*.msi
+            dist/nsis/*.exe
+            dist/appimage/*.AppImage
+            dist/deb/*.deb
+            dist/rpm/*.rpm
