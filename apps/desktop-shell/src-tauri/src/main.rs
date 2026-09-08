@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Tauri shell for the dsh web GUI (v1 prototype).
+//! Tauri shell for the dsh web GUI (v2: bundled-runtime sidecar).
 //!
 //! Starts `dsh web` as a child process, reads the `dsh web: <url>` readiness
 //! line from its stdout, then creates the window directly at that loopback
@@ -8,6 +8,12 @@
 //! Set-Cookie carried on the server's 303, so the page would stay on the
 //! 401 response. Creating the window at the tokenized URL authenticates and
 //! loads the GUI in one step.
+//!
+//! The sidecar runs from the bundled `resources/runtime/` — a Node dist plus
+//! the published `@deepseek-ai/dsh` npm tree produced by
+//! `scripts/embed-runtime.mjs` — so an installed app works with no repo
+//! checkout and no system Node. When the bundle has no runtime (a dev build),
+//! the shell falls back to launching from the repository checkout.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -29,7 +35,7 @@ fn main() {
         .manage(DshProcess(child_slot.clone()))
         .setup(move |app| {
             let handle = app.handle().clone();
-            let mut child = spawn_dsh()?;
+            let mut child = spawn_dsh(&handle)?;
             let stdout = child
                 .stdout
                 .take()
@@ -64,22 +70,63 @@ fn main() {
         });
 }
 
-/// Locate the repository that owns this shell: `DSH_DESKTOP_REPO` overrides,
-/// otherwise walk up from the crate directory to the checkout containing
-/// `apps/cli/src/bin.ts`.
-fn repo_root() -> PathBuf {
+/// How the sidecar launches: from the bundled `resources/runtime/` or from a
+/// repo checkout with a system Node (dev builds and `DSH_DESKTOP_REPO`).
+enum DshLaunch {
+    /// Bundled Node dist plus the published `@deepseek-ai/dsh` npm tree.
+    Bundled { node: PathBuf, root: PathBuf },
+    /// Repo checkout launched through tsx (`node --import tsx/esm`).
+    Dev { node: PathBuf, repo: PathBuf },
+}
+
+/// Entry script of the published dsh package, relative to the runtime root.
+const DSH_CLI: &str = "dsh/node_modules/@deepseek-ai/dsh/lib/bin.js";
+
+/// Pick the sidecar launch. Bundled runtime wins when both its Node and the
+/// dsh entry exist; otherwise fall back to the developer flow.
+fn resolve_launch(handle: &tauri::AppHandle) -> Result<DshLaunch, String> {
     if let Ok(root) = std::env::var("DSH_DESKTOP_REPO") {
-        return PathBuf::from(root);
+        return Ok(DshLaunch::Dev {
+            node: resolve_node()?,
+            repo: PathBuf::from(root),
+        });
+    }
+    if let Ok(resources) = handle.path().resource_dir() {
+        // Bundler layouts keep the `resources/` prefix differently per target;
+        // accept both.
+        for runtime in [resources.join("resources/runtime"), resources.join("runtime")] {
+            let node = [runtime.join("node/bin/node"), runtime.join("node/node.exe")]
+                .into_iter()
+                .find(|candidate| candidate.is_file());
+            if let (Some(node), bin) = (node, runtime.join(DSH_CLI)) {
+                if bin.is_file() {
+                    eprintln!(
+                        "dsh-desktop-shell: using bundled runtime at {}",
+                        runtime.display()
+                    );
+                    return Ok(DshLaunch::Bundled { node, root: runtime });
+                }
+            }
+        }
+        eprintln!(
+            "dsh-desktop-shell: no bundled runtime under {}, falling back to a repo checkout",
+            resources.display()
+        );
     }
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     while dir.pop() {
         if dir.join("apps/cli/src/bin.ts").is_file() {
-            return dir;
+            return Ok(DshLaunch::Dev {
+                node: resolve_node()?,
+                repo: dir,
+            });
         }
     }
-    panic!(
-        "dsh checkout not found above this crate; set DSH_DESKTOP_REPO to the repo root"
-    );
+    Err(
+        "no bundled dsh runtime and no repo checkout above this crate; set DSH_DESKTOP_REPO to \
+         the repo root"
+            .to_owned(),
+    )
 }
 
 /// Node executable for the sidecar. Finder/Dock launches come from launchd
@@ -157,16 +204,29 @@ fn newest_nvm_node(home: &Path) -> Option<PathBuf> {
 }
 
 /// Start `dsh web` on an OS-assigned port with the browser handoff disabled.
-fn spawn_dsh() -> Result<Child, Box<dyn std::error::Error>> {
-    let node = resolve_node().map_err(|reason| -> Box<dyn std::error::Error> {
-        format!("failed to launch `node` for dsh web: {reason}").into()
+fn spawn_dsh(handle: &tauri::AppHandle) -> Result<Child, Box<dyn std::error::Error>> {
+    let launch = resolve_launch(handle).map_err(|reason| -> Box<dyn std::error::Error> {
+        format!("failed to resolve the dsh sidecar: {reason}").into()
     })?;
+    let (node, mut command) = match &launch {
+        DshLaunch::Bundled { node, root } => {
+            let mut command = Command::new(node);
+            command
+                .arg(root.join(DSH_CLI))
+                .current_dir(root.join("dsh"));
+            (node.clone(), command)
+        }
+        DshLaunch::Dev { node, repo } => {
+            let mut command = Command::new(node);
+            command
+                .args(["--import", "tsx/esm", "apps/cli/src/bin.ts"])
+                .current_dir(repo);
+            (node.clone(), command)
+        }
+    };
     eprintln!("dsh-desktop-shell: sidecar node at {}", node.display());
-    let mut command = Command::new(&node);
     command
-        .args(["--import", "tsx/esm", "apps/cli/src/bin.ts"])
         .args(["web", "--no-open", "--port", "0"])
-        .current_dir(repo_root())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

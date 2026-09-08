@@ -37,12 +37,15 @@ jobs:
         include:
           - os: macos-latest
             name: macos-arm64
+            runtime-platform: darwin-arm64
             artifacts: apps/desktop-shell/src-tauri/target/release/bundle
           - os: windows-latest
             name: windows-x64
+            runtime-platform: win-x64
             artifacts: apps/desktop-shell/src-tauri/target/release/bundle
           - os: ubuntu-latest
             name: linux-x64
+            runtime-platform: linux-x64
             artifacts: apps/desktop-shell/src-tauri/target/release/bundle
     steps:
       - uses: actions/checkout@v6
@@ -50,14 +53,9 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: pnpm/action-setup@v4
-        with:
-          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
-
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
-          cache: pnpm
 
       - name: install linux webkit deps
         if: runner.os == 'Linux'
@@ -65,12 +63,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - run: pnpm install --frozen-lockfile
-        shell: bash
-
-      # dsh web requires the built frontend dist at startup; the shell spawns
-      # the CLI from source, so the whole repo must be built before bundling.
-      - run: pnpm run build
+      # The app embeds the published @deepseek-ai/dsh npm tree plus an
+      # official Node distribution, so the bundle needs no repo build.
+      - name: embed dsh runtime
+        working-directory: apps/desktop-shell
+        run: node scripts/embed-runtime.mjs --platform ${{ matrix.runtime-platform }}
         shell: bash
 
       - name: bundle desktop shell
