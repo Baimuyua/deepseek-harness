@@ -6,7 +6,7 @@
 // with no external Node or repository checkout required.
 //
 // Usage: node scripts/embed-runtime.mjs --platform <darwin-arm64|win-x64|linux-x64>
-//        [--dsh-version 0.1.3-alpha.2] [--node-version v24.11.1]
+//        [--dsh-version 0.1.3-alpha.2] [--node-version v24.11.1] [--pnpm-version 11.7.0]
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -22,7 +22,7 @@ const PLATFORMS = ['darwin-arm64', 'win-x64', 'linux-x64'];
 const PTY_PREBUILD_DIR = { 'darwin-arm64': 'darwin-arm64', 'win-x64': 'win32-x64', 'linux-x64': 'linux-x64' };
 
 function parseArgs(argv) {
-  const args = { dshVersion: '0.1.3-alpha.2', nodeVersion: 'v24.11.1' };
+  const args = { dshVersion: '0.1.3-alpha.2', nodeVersion: 'v24.11.1', pnpmVersion: '11.7.0' };
   for (let i = 2; i < argv.length; i += 1) {
     const key = argv[i].replace(/^--/, '');
     const value = argv[i + 1];
@@ -112,6 +112,36 @@ async function embedDsh(platform, dshVersion) {
   if (!existsSync(bin)) throw new Error(`dsh CLI entry missing after install: ${bin}`);
 }
 
+// Embed pnpm: the desktop app seeds its bundled market plugin and runs any
+// later `dsh plugin` transactions through this copy, because pruneRuntime
+// deletes the Node dist's own npm below. pnpm is pure JavaScript, so no ABI
+// selection is needed, but install before pruning.
+async function embedPnpm(platform, pnpmVersion) {
+  const pnpmDir = join(RUNTIME_DIR, 'pnpm');
+  await rm(pnpmDir, { recursive: true, force: true });
+  await mkdir(pnpmDir, { recursive: true });
+  const nodeDir = join(RUNTIME_DIR, 'node');
+  const nodeBin = platform === 'win-x64' ? join(nodeDir, 'node.exe') : join(nodeDir, 'bin/node');
+  const npmCli = platform === 'win-x64'
+    ? join(nodeDir, 'node_modules/npm/bin/npm-cli.js')
+    : join(nodeDir, 'lib/node_modules/npm/bin/npm-cli.js');
+  run(nodeBin, [
+    npmCli,
+    'install',
+    '--prefix', pnpmDir,
+    `pnpm@${pnpmVersion}`,
+    '--no-audit',
+    '--no-fund',
+  ], {
+    env: {
+      ...process.env,
+      PATH: `${platform === 'win-x64' ? nodeDir : join(nodeDir, 'bin')}${platform === 'win-x64' ? ';' : ':'}${process.env.PATH}`,
+    },
+  });
+  const entry = join(pnpmDir, 'node_modules/pnpm/bin/pnpm.cjs');
+  if (!existsSync(entry)) throw new Error(`pnpm entry missing after install: ${entry}`);
+}
+
 // Sum the bytes removed by deleting every file matching `predicate` under dir.
 async function stripFiles(dir, predicate) {
   let removed = 0;
@@ -129,8 +159,9 @@ async function stripFiles(dir, predicate) {
 }
 
 // Drop everything the sidecar never loads: Node build headers and its bundled
-// npm/corepack (used only during this script), Node docs, dsh sourcemaps and
-// type declarations, and node-pty prebuilds for other platforms.
+// npm/corepack (the desktop's package manager lives in runtime/pnpm, kept on
+// purpose), Node docs, dsh sourcemaps and type declarations, and node-pty
+// prebuilds for other platforms.
 async function pruneRuntime(platform) {
   const nodeDir = join(RUNTIME_DIR, 'node');
   for (const rel of [
@@ -173,12 +204,14 @@ const args = parseArgs(process.argv);
 await mkdir(RUNTIME_DIR, { recursive: true });
 await embedNode(args.platform, args.nodeVersion);
 await embedDsh(args.platform, args.dshVersion);
+await embedPnpm(args.platform, args.pnpmVersion);
 const pruned = await pruneRuntime(args.platform);
 console.log(`pruned ${(pruned.maps / 1e6).toFixed(1)}MB sourcemaps, ${(pruned.types / 1e6).toFixed(1)}MB type declarations`);
 const manifest = {
   protocol: 1,
   dshVersion: args.dshVersion,
   nodeVersion: args.nodeVersion,
+  pnpmVersion: args.pnpmVersion,
   platform: args.platform,
   createdAt: new Date().toISOString(),
 };

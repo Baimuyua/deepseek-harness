@@ -82,6 +82,23 @@ enum DshLaunch {
 /// Entry script of the published dsh package, relative to the runtime root.
 const DSH_CLI: &str = "dsh/node_modules/@deepseek-ai/dsh/lib/bin.js";
 
+/// The community plugin market bundled with the desktop app, pinned per
+/// release so one app build never drifts with upstream publishes.
+const MARKET_SPEC: &str = "dshmarket@1.45.1";
+
+/// Package name `ensure_market_plugin` looks for inside the profile manifest.
+const MARKET_NAME: &str = "dshmarket";
+
+/// Marker dropped into the profile directory after the first successful
+/// embedded install. Its presence means "the shell already seeded the market
+/// once": a removed dependency with the marker present is a user uninstall
+/// and must not be reinstalled on the next launch.
+const MARKET_MARKER: &str = ".dshmarket-embedded";
+
+/// Embedded pnpm binaries, relative to the runtime root. `embed-runtime.mjs`
+/// installs pnpm here because the pruned Node dist no longer carries npm.
+const PNPM_BIN_DIR: &str = "pnpm/node_modules/.bin";
+
 /// Pick the sidecar launch. Bundled runtime wins when both its Node and the
 /// dsh entry exist; otherwise fall back to the developer flow.
 fn resolve_launch(handle: &tauri::AppHandle) -> Result<DshLaunch, String> {
@@ -203,11 +220,140 @@ fn newest_nvm_node(home: &Path) -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
+/// A login-like PATH for dsh subprocesses: the node directory first, the
+/// given extra prefixes, Homebrew, then the inherited PATH. launchd hands
+/// Finder-launched apps a minimal PATH, so every child we spawn gets this.
+fn login_like_path(node: &Path, extra: &[PathBuf]) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    let mut dirs = vec![
+        node.parent().map(Path::to_path_buf).unwrap_or_default(),
+    ];
+    dirs.extend(extra.iter().cloned());
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    if let Ok(path) = std::env::var("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(dirs)
+}
+
+/// The DeepSeek Harness home: `$DSH_HOME` when set and non-blank (with ~
+/// expansion), otherwise `~/.dsh` — the same rules as app-boot.
+fn dsh_home() -> Option<PathBuf> {
+    let raw = std::env::var("DSH_HOME").ok();
+    let raw = raw.filter(|value| !value.trim().is_empty());
+    let expanded = match raw {
+        Some(value) if value.starts_with("~/") || value.starts_with("~\\") => {
+            let home = std::env::var("HOME").ok()?;
+            PathBuf::from(home).join(&value[2..])
+        }
+        Some(value) => PathBuf::from(value),
+        None => PathBuf::from(std::env::var("HOME").ok()?).join(".dsh"),
+    };
+    Some(expanded)
+}
+
+/// Seed the desktop app with the community plugin market. Before the sidecar
+/// ever composes the `web` profile, install the pinned market spec into it —
+/// so the market is live on first launch with no restart round. No-ops when
+/// the profile already carries it, when an earlier seeding succeeded (the
+/// marker file; a missing dependency at that point is a user uninstall), and
+/// tolerated on any failure: the app works offline, and the next launch
+/// retries.
+fn ensure_market_plugin(launch: &DshLaunch) {
+    let Some(home) = dsh_home() else {
+        eprintln!("dsh-desktop-shell: HOME is unset; skipping the embedded market install");
+        return;
+    };
+    let profile_dir = home.join("profiles/web");
+    let marker = profile_dir.join(MARKET_MARKER);
+    let manifest = std::fs::read_to_string(profile_dir.join("package.json")).unwrap_or_default();
+    if manifest
+        .split('"')
+        .any(|token| token == MARKET_NAME)
+    {
+        // Seeded through another channel; mark it so a later dependency
+        // removal reads as a deliberate uninstall. A marker left by this
+        // seeder keeps its installed spec.
+        if !marker.is_file() {
+            let _ = std::fs::write(&marker, "installed=outside-shell\n");
+        }
+        return;
+    }
+    if marker.is_file() {
+        return;
+    }
+    eprintln!("dsh-desktop-shell: installing the embedded market plugin: {MARKET_SPEC}");
+    let (node, mut command) = match launch {
+        DshLaunch::Bundled { node, root } => {
+            let mut command = Command::new(node);
+            command
+                .arg(root.join(DSH_CLI))
+                .current_dir(root.join("dsh"));
+            // The embedded pnpm bin dir covers `spawnSync('pnpm', …)` in the
+            // CLI; the pruned Node dist has no package manager of its own.
+            match login_like_path(node, &[root.join(PNPM_BIN_DIR)]) {
+                Ok(path) => {
+                    command.env("PATH", path);
+                }
+                Err(error) => {
+                    eprintln!("dsh-desktop-shell: PATH join failed: {error}");
+                    return;
+                }
+            }
+            (node.clone(), command)
+        }
+        DshLaunch::Dev { node, repo } => {
+            let mut command = Command::new(node);
+            command
+                .args(["--import", "tsx/esm", "apps/cli/src/bin.ts"])
+                .current_dir(repo);
+            match login_like_path(node, &[]) {
+                Ok(path) => {
+                    command.env("PATH", path);
+                }
+                Err(error) => {
+                    eprintln!("dsh-desktop-shell: PATH join failed: {error}");
+                    return;
+                }
+            }
+            (node.clone(), command)
+        }
+    };
+    let result = command
+        .args(["plugin", "--profile", "web", "add", MARKET_SPEC])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("DSH_HOME", home.as_os_str())
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            let _ = std::fs::write(&marker, format!("spec={MARKET_SPEC}\n"));
+            eprintln!("dsh-desktop-shell: embedded market plugin installed with {}", node.display());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "dsh-desktop-shell: market plugin install failed (status {:?}); retrying next launch: {}",
+                output.status.code(),
+                stderr.trim()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "dsh-desktop-shell: market plugin install failed to launch ({}): {error}",
+                node.display()
+            );
+        }
+    }
+}
+
 /// Start `dsh web` on an OS-assigned port with the browser handoff disabled.
 fn spawn_dsh(handle: &tauri::AppHandle) -> Result<Child, Box<dyn std::error::Error>> {
     let launch = resolve_launch(handle).map_err(|reason| -> Box<dyn std::error::Error> {
         format!("failed to resolve the dsh sidecar: {reason}").into()
     })?;
+    ensure_market_plugin(&launch);
     let (node, mut command) = match &launch {
         DshLaunch::Bundled { node, root } => {
             let mut command = Command::new(node);
@@ -232,17 +378,7 @@ fn spawn_dsh(handle: &tauri::AppHandle) -> Result<Child, Box<dyn std::error::Err
         .stderr(Stdio::piped());
     // The launchd PATH omits the node directory and Homebrew; give the
     // sidecar a login-like PATH so its own subprocesses resolve as in a shell.
-    if let Some(node_dir) = node.parent() {
-        let mut dirs = vec![
-            node_dir.to_path_buf(),
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/usr/local/bin"),
-        ];
-        if let Ok(path) = std::env::var("PATH") {
-            dirs.extend(std::env::split_paths(&path));
-        }
-        command.env("PATH", std::env::join_paths(dirs)?);
-    }
+    command.env("PATH", login_like_path(&node, &[])?);
     command
         .spawn()
         .map_err(|error| -> Box<dyn std::error::Error> {
